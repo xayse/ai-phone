@@ -1,0 +1,13 @@
+{
+  "name": "promptophone",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Игра в испорченный телефон с картинками AI Horde",
+  "scripts": {
+    "start": "node server/local.mjs",
+    "test": "node --test server/*.test.mjs",
+    "prepare-site": "node tools/prepare-site.mjs"
+  },
+  "engines": { "node": ">=22" }
+}
