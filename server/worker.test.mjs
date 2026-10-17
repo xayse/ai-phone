@@ -58,7 +58,7 @@ function mockHorde(t, { imageBytes = 200000 } = {}) {
     requests.push({ url, init });
     if (url.includes('/status/models?')) return Response.json([{ name: 'Dreamshaper', count: 3, type: 'image' }]);
     if (url.endsWith('/generate/async')) return Response.json({ id: `request-${++serial}` });
-    if (url.includes('/generate/check/')) return Response.json({ done: true, finished: 1, faulted: false });
+    if (url.includes('/generate/check/')) return Response.json({ done: true, finished: 1, faulted: false, wait_time: 125, queue_position: 7 });
     if (url.includes('/generate/status/') && init.method === 'DELETE') return Response.json({ generations: [] });
     if (url.includes('/generate/status/')) return Response.json({ generations: [{ img: Buffer.alloc(imageBytes, 12).toString('base64'), censored: false }] });
     throw new Error(`Unexpected outgoing URL ${url}`);
@@ -165,7 +165,7 @@ test('generation timeout waits for the host, supports retry and skip, and keeps 
   await p.action(0, 'start');
   await p.action(0, 'submit', 'Лягушка с зонтом'); await p.action(1, 'submit', 'Ёжик в лодке');
   await p.room.alarm();
-  for (const job of p.room.data.jobs) job.startedAt = Date.now() - 301000;
+  for (const job of p.room.data.jobs) job.startedAt = Date.now() - 901000;
   await p.room.alarm();
   const state = (await p.state(0)).body;
   assert.equal(state.phase, 'generating'); assert.equal(state.generation.failed, 2);
@@ -280,9 +280,45 @@ test('successful completion checks do not erase repeated result retrieval failur
     const job = p.room.data.jobs[0];
     assert.equal(job.failures, attempt);
     assert.equal(job.status, attempt < 3 ? 'processing' : 'failed');
+    if (attempt < 3) {
+      const waiting = (await p.state(0)).body;
+      assert.equal(waiting.generation.waitSeconds, 125);
+      assert.equal(waiting.generation.queuePosition, 7);
+      assert.match(waiting.generation.message, /примерно в 3 мин/);
+      assert.ok(!JSON.stringify(waiting).includes(job.requestId));
+    }
   }
   assert.equal(resultAttempts, 3);
   const state = (await p.state(0)).body;
   assert.equal(state.phase, 'generating'); assert.equal(state.generation.failed, 1);
   assert.match(state.generation.message, /503/);
+  const retried = (await p.action(0, 'retry')).body;
+  assert.equal(retried.generation.waitSeconds, 0);
+  assert.equal(retried.generation.queuePosition, 0);
+  assert.equal(p.room.data.jobs[0].waitSeconds, 0);
+  assert.equal(p.room.data.jobs[0].queuePosition, 0);
+});
+
+test('image downloads use Workers-compatible manual redirects and reject redirects before reading the body', async t => {
+  mockHorde(t, { imageBytes: 32 });
+  const upstream = globalThis.fetch;
+  let imageRequests = 0;
+  let bodyRead = false;
+  globalThis.fetch = async (input, init = {}) => {
+    if (String(input) !== 'https://r2.aihorde.net/image.webp') return upstream(input, init);
+    imageRequests++;
+    assert.equal(init.redirect, 'manual');
+    const response = new Response(null, { status: 302, headers: { Location: 'https://untrusted.example/redirected.webp' } });
+    response.arrayBuffer = async () => { bodyRead = true; throw new Error('A redirect body must not be read'); };
+    return response;
+  };
+  const h = harness(); const p = await party(h, { count: 2, rounds: 1 });
+  await p.action(0, 'start');
+  await p.action(0, 'submit', 'A cat piloting a spaceship'); await p.action(1, 'skip');
+  const job = p.room.data.jobs[0];
+  await assert.rejects(p.room.storeGeneration({ img: 'https://r2.aihorde.net/image.webp' }, job), /Не удалось скачать/);
+  assert.equal(imageRequests, 1);
+  assert.equal(bodyRead, false);
+  assert.ok(!p.room.data.chains[0].entries.some(e => e.type === 'image'));
+  assert.equal([...p.room.storage.map.keys()].filter(k => k.startsWith('image:')).length, 0);
 });

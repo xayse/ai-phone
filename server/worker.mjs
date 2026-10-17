@@ -1,6 +1,6 @@
 /** AI Phone API. The same module runs on Cloudflare and the local Node adapter. */
 const ROOM_TTL = 24 * 60 * 60 * 1000;
-const JOB_TIMEOUT = 5 * 60 * 1000;
+const JOB_TIMEOUT = 15 * 60 * 1000;
 const POLL_MS = 8000;
 const MAX_CONCURRENT = 2;
 const IMAGE_CHUNK = 96 * 1024;
@@ -232,7 +232,7 @@ export class Room {
         for (const job of this.data.jobs) {
           if (job.status !== 'failed') continue;
           this.data.chains[job.chainIndex].entries = this.data.chains[job.chainIndex].entries.filter(e => e.jobId !== job.id || e.type !== 'error');
-          Object.assign(job, { status: 'queued', requestId: null, startedAt: null, error: null, failures: 0 });
+          Object.assign(job, { status: 'queued', requestId: null, startedAt: null, error: null, failures: 0, waitSeconds: 0, queuePosition: 0 });
           retried++;
         }
         if (!retried) throw new HttpError(409, 'Ошибок пока нет. Картинки ещё создаются.');
@@ -301,6 +301,9 @@ export class Room {
   publicState(player, origin) {
     const data = this.data;
     const imageUrl = id => `${origin}/api/rooms/${data.code}/images/${id}?token=${encodeURIComponent(player.token)}`;
+    const processing = data.jobs.filter(j => j.status === 'processing');
+    const waitSeconds = Math.max(0, ...processing.map(j => j.waitSeconds || 0));
+    const queuePosition = Math.max(0, ...processing.map(j => j.queuePosition || 0));
     let currentTask = null;
     if (['writing', 'generating'].includes(data.phase)) {
       const chain = data.chains[this.chainFor(player.id)];
@@ -318,9 +321,10 @@ export class Room {
         done: data.jobs.filter(j => ['done', 'skipped'].includes(j.status)).length,
         total: data.jobs.length,
         queued: data.jobs.filter(j => j.status === 'queued').length,
-        processing: data.jobs.filter(j => j.status === 'processing').length,
+        processing: processing.length,
         failed: data.jobs.filter(j => j.status === 'failed').length,
-        message: data.jobs.some(j => j.status === 'failed') ? `${data.jobs.find(j => j.status === 'failed').error} Ведущий может повторить запрос или продолжить с пропуском.` : 'Картинки создаются в общей очереди AI Horde. Это может занять несколько минут.'
+        waitSeconds, queuePosition,
+        message: data.jobs.some(j => j.status === 'failed') ? `${data.jobs.find(j => j.status === 'failed').error} Ведущий может повторить запрос или продолжить с пропуском.` : waitSeconds > 60 ? `AI Horde оценивает ожидание примерно в ${Math.ceil(waitSeconds / 60)} мин. Время может меняться.` : 'Картинки создаются в общей очереди AI Horde. Это может занять несколько минут.'
       }
     };
     if (data.phase === 'reveal') {
@@ -411,7 +415,8 @@ export class Room {
       // Only Horde's own image storage is allowed; never fetch arbitrary internal or player-supplied URLs.
       const url = new URL(generation.img);
       if (!(url.hostname === 'aihorde.net' || url.hostname.endsWith('.aihorde.net') || url.hostname.endsWith('.r2.dev') || url.hostname.endsWith('.r2.cloudflarestorage.com'))) throw new Error('AI Horde вернул неизвестный адрес картинки.');
-      const response = await fetch(url, { signal: AbortSignal.timeout(15000), redirect: 'error' });
+      // Workers supports manual/follow only. Never follow a storage redirect to another host.
+      const response = await fetch(url, { signal: AbortSignal.timeout(15000), redirect: 'manual' });
       if (!response.ok) throw new Error('Не удалось скачать картинку AI Horde.');
       if (Number(response.headers.get('content-length')) > MAX_IMAGE_BYTES) throw new Error('Слишком большой файл картинки.');
       const type = response.headers.get('content-type')?.split(';')[0];
@@ -439,10 +444,12 @@ export class Room {
     for (const job of this.data.jobs.filter(j => j.status === 'processing')) {
       try {
         if (Date.now() - job.startedAt >= JOB_TIMEOUT) {
-          this.failJob(job, 'AI Horde не успел создать картинку за 5 минут. Повторите или пропустите генерацию.');
+          this.failJob(job, 'AI Horde не успел создать картинку за 15 минут. Повторите или пропустите генерацию.');
           await this.save(); await this.cancel(job.requestId); continue;
         }
         const check = await this.horde(`/generate/check/${encodeURIComponent(job.requestId)}`);
+        job.waitSeconds = typeof check.wait_time === 'number' && Number.isFinite(check.wait_time) ? clamp(check.wait_time, 0, 86400, 0) : 0;
+        job.queuePosition = typeof check.queue_position === 'number' && Number.isFinite(check.queue_position) ? clamp(check.queue_position, 0, 1000000, 0) : 0;
         if (check.faulted || check.is_possible === false) { this.failJob(job, 'Сейчас в AI Horde нет доступного исполнителя. Повторите запрос позже.'); continue; }
         if (!check.done && !(check.finished >= 1)) { job.failures = 0; continue; }
         const status = await this.horde(`/generate/status/${encodeURIComponent(job.requestId)}`);
