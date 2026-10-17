@@ -58,7 +58,11 @@ function mockHorde(t, { imageBytes = 200000 } = {}) {
   globalThis.fetch = async (input, init = {}) => {
     const url = String(input);
     requests.push({ url, init });
+    if (url.includes('/status/models?type=text')) return Response.json([{ name: 'koboldcpp/Qwen2.5-Coder-3B-Instruct', count: 2, type: 'text' }]);
     if (url.includes('/status/models?')) return Response.json([{ name: 'Dreamshaper', count: 3, type: 'image' }]);
+    if (url.endsWith('/generate/text/async')) return Response.json({ id: `text-${++serial}` });
+    if (url.includes('/generate/text/status/') && init.method === 'DELETE') return Response.json({ done: true, generations: [] });
+    if (url.includes('/generate/text/status/')) return Response.json({ done: true, finished: 1, generations: [{ text: 'A cheerful octopus is cooking pancakes on the Moon<|im_end|>' }] });
     if (url.endsWith('/generate/async')) return Response.json({ id: `request-${++serial}` });
     if (url.includes('/generate/check/')) return Response.json({ done: true, finished: 1, faulted: false, wait_time: 125, queue_position: 7 });
     if (url.includes('/generate/status/') && init.method === 'DELETE') return Response.json({ generations: [] });
@@ -69,6 +73,7 @@ function mockHorde(t, { imageBytes = 200000 } = {}) {
   return requests;
 }
 async function completeGeneration(room) {
+  await room.ready;
   for (let i = 0; i < 20 && room.data.phase === 'generating'; i++) await room.alarm();
   assert.notEqual(room.data.phase, 'generating');
 }
@@ -103,6 +108,8 @@ test('parallel chains rotate, hide prompts, protect images, and reveal albums pr
   await p.action(1, 'submit', 'Собака на скейте'); await p.action(2, 'submit', 'Рыба у компьютера');
   assert.equal(p.room.data.phase, 'generating');
   await p.room.alarm();
+  assert.equal(outgoing.filter(r => r.url.endsWith('/generate/text/async')).length, 2, 'only two translation jobs run concurrently');
+  await p.room.alarm(); await p.room.alarm();
   assert.equal(outgoing.filter(r => r.url.endsWith('/generate/async')).length, 2, 'only two jobs run concurrently');
   const firstGeneration = outgoing.find(r => r.url.endsWith('/generate/async'));
   const payload = JSON.parse(firstGeneration.init.body);
@@ -165,7 +172,7 @@ test('generation timeout waits for the host, supports retry and skip, and keeps 
   mockHorde(t, { imageBytes: 32 });
   const h = harness(); const p = await party(h, { count: 2, rounds: 1 });
   await p.action(0, 'start');
-  await p.action(0, 'submit', 'Лягушка с зонтом'); await p.action(1, 'submit', 'Ёжик в лодке');
+  await p.action(0, 'submit', 'A frog with an umbrella'); await p.action(1, 'submit', 'A hedgehog in a boat');
   await p.room.alarm();
   for (const job of p.room.data.jobs) job.startedAt = Date.now() - 901000;
   await p.room.alarm();
@@ -177,7 +184,7 @@ test('generation timeout waits for the host, supports retry and skip, and keeps 
   await p.room.alarm(); await p.room.alarm();
   assert.equal(p.room.data.phase, 'reveal');
   await p.action(0, 'lobby'); await p.action(0, 'start');
-  await p.action(0, 'submit', 'Чайник в пустыне'); await p.action(1, 'submit', 'Утка на луне');
+  await p.action(0, 'submit', 'A teapot in the desert'); await p.action(1, 'submit', 'A duck on the Moon');
   await p.room.alarm();
   assert.equal((await p.action(1, 'skip')).response.status, 403);
   assert.equal((await p.action(0, 'skip')).body.phase, 'reveal');
@@ -264,7 +271,7 @@ test('failed translation stops an unrelated Horde request and the host can retry
   assert.equal(p.room.data.chains[0].entries[0].text, 'Лягушка в фиолетовой шляпе');
   assert.equal((await p.state(0)).body.generation.failed, 0);
   const noAI = harness();
-  assert.equal((await noAI.call('/api/health')).body.translationAvailable, false);
+  assert.equal((await noAI.call('/api/health')).body.translationAvailable, true);
 });
 
 test('successful completion checks do not erase repeated result retrieval failures', async t => {
@@ -476,4 +483,295 @@ test('the translator rejects malformed or still-Russian output and keeps embedde
     assert.ok(!call.input.messages[0].content.includes(source));
   }
   assert.equal(outgoing.length, 0);
+});
+
+test('a temporary translation capacity failure recovers with exactly one automatic retry', async t => {
+  const outgoing = mockHorde(t, { imageBytes: 32 });
+  const h = harness(); let calls = 0;
+  h.env.AI = { run: async () => {
+    if (++calls === 1) throw new Error('3040: Capacity temporarily exceeded, please try again.');
+    return { response: 'A cheerful octopus is cooking pancakes on the Moon' };
+  } };
+  const p = await party(h, { count: 2, rounds: 1 });
+  await p.action(0, 'start'); await p.action(0, 'submit', 'Весёлый осьминог печёт блины на Луне'); await p.action(1, 'skip');
+  await completeGeneration(p.room);
+  assert.equal(calls, 2); assert.equal(p.room.data.phase, 'reveal');
+  assert.equal(outgoing.filter(r => r.url.endsWith('/generate/async')).length, 1);
+  assert.equal(p.room.data.chains[0].entries[0].text, 'Весёлый осьминог печёт блины на Луне');
+});
+
+test('a remaining Cyrillic proper name gets one format correction with the original source unchanged', async t => {
+  const outgoing = mockHorde(t, { imageBytes: 32 });
+  const h = harness(); const calls = [];
+  const source = 'Чебурашка и Баба Яга играют в шахматы на Луне';
+  h.env.AI = { run: async (model, input) => {
+    calls.push({ model, input });
+    return { response: calls.length === 1 ? 'Cheburashka and Баба Яга play chess on the Moon' : 'Cheburashka and Baba Yaga play chess on the Moon' };
+  } };
+  const p = await party(h, { count: 2, rounds: 1 });
+  await p.action(0, 'start'); await p.action(0, 'submit', source); await p.action(1, 'skip');
+  await completeGeneration(p.room);
+  assert.equal(calls.length, 2);
+  assert.match(calls[1].input.messages[0].content, /format correction/);
+  assert.match(calls[1].input.messages[0].content, /never transliterate the whole sentence/);
+  assert.equal(calls[1].input.messages[1].content, source);
+  const sent = outgoing.find(r => r.url.endsWith('/generate/async'));
+  assert.ok(JSON.parse(sent.init.body).prompt.startsWith('Cheburashka and Baba Yaga play chess on the Moon'));
+  assert.equal(p.room.data.chains[0].entries[0].text, source);
+});
+
+test('access errors and content policy errors are specific and never automatically retried', async t => {
+  const outgoing = mockHorde(t);
+  const cases = [
+    { upstream: '5018: The account is not allowed to access this model.', category: 'access', expected: /недоступен для этого аккаунта или модели/ },
+    { upstream: 'Content policy violation: request rejected.', category: 'content', expected: /отклонила описание по правилам сервиса/ }
+  ];
+  for (const scenario of cases) {
+    const h = harness(); let calls = 0;
+    h.env.AI = { run: async () => { calls++; throw new Error(scenario.upstream); } };
+    const p = await party(h, { count: 2, rounds: 1 });
+    await p.action(0, 'start'); await p.action(0, 'submit', 'Осьминог на Луне'); await p.action(1, 'skip');
+    await p.room.alarm();
+    const state = (await p.state(0)).body;
+    assert.equal(calls, 1, scenario.category);
+    assert.equal(state.generation.failed, 1);
+    assert.equal(p.room.data.jobs[0].translationErrorCategory, scenario.category);
+    assert.match(state.generation.message, scenario.expected);
+    assert.ok(!JSON.stringify(state).includes(scenario.upstream));
+  }
+  assert.equal(outgoing.length, 0, 'failed translation must not submit raw Russian to a generator');
+});
+
+test('two translation timeouts stop without an unbounded retry loop', async t => {
+  const outgoing = mockHorde(t);
+  const h = harness(); let calls = 0;
+  h.env.AI = { run: async () => { calls++; throw new Error('3007: Request timeout'); } };
+  const p = await party(h, { count: 2, rounds: 1 });
+  await p.action(0, 'start'); await p.action(0, 'submit', 'Осьминог на Луне'); await p.action(1, 'skip');
+  await p.room.alarm();
+  const state = (await p.state(0)).body;
+  assert.equal(calls, 2); assert.equal(state.generation.failed, 1);
+  assert.equal(p.room.data.jobs[0].translationErrorCategory, 'timeout');
+  assert.match(state.generation.message, /не ответил вовремя/);
+  await p.room.alarm(); assert.equal(calls, 2, 'failed jobs require an explicit host retry');
+  assert.equal(outgoing.length, 0);
+});
+
+test('a translation error arriving after a room restart neither retries nor changes the new game', async t => {
+  const outgoing = mockHorde(t);
+  const h = harness({ background: true }); delete h.env.IMAGE_PROVIDER;
+  let reject; let begin; let calls = 0;
+  const deferred = new Promise((_, fail) => { reject = fail; });
+  const started = new Promise(resolve => { begin = resolve; });
+  h.env.AI = { run: async () => { calls++; begin(); return deferred; } };
+  const p = await party(h, { count: 2, rounds: 1 });
+  await p.action(0, 'start'); await p.action(0, 'submit', 'Осьминог на Луне'); await p.action(1, 'skip');
+  await p.room.alarm(); await started;
+  await p.action(0, 'skip'); await p.action(0, 'lobby'); await p.action(0, 'start');
+  reject(new Error('3040: Capacity temporarily exceeded.')); await h.drain();
+  assert.equal(calls, 1); assert.equal(outgoing.length, 0);
+  assert.equal(p.room.data.phase, 'writing');
+  assert.ok(p.room.data.chains.every(chain => chain.entries.length === 0));
+});
+
+test('an existing English translation still permits Horde image fallback when the Cloudflare quota is exhausted', async t => {
+  const outgoing = mockHorde(t, { imageBytes: 32 });
+  const h = harness(); delete h.env.IMAGE_PROVIDER;
+  const calls = [];
+  h.env.AI = { run: async model => { calls.push(model); throw new Error('3036: You have used up your daily free allocation of 10,000 neurons.'); } };
+  const p = await party(h, { count: 2, rounds: 1 });
+  await p.action(0, 'start'); await p.action(0, 'submit', 'Осьминог на Луне'); await p.action(1, 'skip');
+  p.room.data.jobs[0].imagePrompt = 'An octopus on the Moon'; await p.room.save();
+  await completeGeneration(p.room);
+  assert.deepEqual(calls, ['@cf/black-forest-labs/flux-1-schnell']);
+  assert.equal(outgoing.filter(r => r.url.endsWith('/generate/async')).length, 1);
+  assert.equal(p.room.data.chains[0].entries.find(e => e.type === 'image').author, 'AI Horde');
+});
+
+test('a new Russian job survives CF quota exhaustion, a persisted Horde translation, and object reconstruction', async t => {
+  const outgoing = mockHorde(t, { imageBytes: 32 });
+  const h = harness(); delete h.env.IMAGE_PROVIDER; let cfCalls = 0;
+  h.env.AI = { run: async () => { cfCalls++; throw new Error('3036: You have used up your daily free allocation of 10,000 neurons.'); } };
+  const p = await party(h, { count: 2, rounds: 1 });
+  await p.action(0, 'start'); await p.action(0, 'submit', 'Весёлый осьминог печёт блины на Луне'); await p.action(1, 'skip');
+  await p.room.alarm();
+  const job = p.room.data.jobs[0]; const textId = job.translationRequestId;
+  assert.ok(textId, 'a fresh job with no translateModel must actually POST text and persist the ID');
+  assert.equal(job.provider, 'translation'); assert.ok(job.translationStartedAt);
+  assert.ok(p.room.data.cloudflareQuotaUntil > Date.now()); assert.equal(cfCalls, 1);
+  assert.equal((await p.state(0)).body.generation.provider, 'horde');
+  assert.match((await p.state(0)).body.generation.message, /переводит описания/);
+  const request = outgoing.find(r => r.url.endsWith('/generate/text/async'));
+  const payload = JSON.parse(request.init.body);
+  assert.equal(request.init.headers.apikey, '0000000000');
+  assert.deepEqual(payload.models, ['koboldcpp/Qwen2.5-Coder-3B-Instruct']);
+  assert.equal(payload.params.max_context_length, 2048); assert.equal(payload.params.max_length, 256);
+  assert.ok(payload.prompt.includes('<|im_start|>user\nВесёлый осьминог печёт блины на Луне'));
+  const restored = new Room({ storage: p.room.storage }, h.env); h.rooms.set(p.code, restored);
+  await completeGeneration(restored);
+  assert.equal(outgoing.filter(r => r.url.endsWith('/generate/text/async')).length, 1, 'restoring a room must poll the existing text ID');
+  assert.equal(outgoing.filter(r => r.url.endsWith('/generate/async')).length, 1);
+  assert.ok(outgoing.some(r => r.url.endsWith(`/generate/text/status/${textId}`)));
+  assert.equal(cfCalls, 1, 'neither translation nor FLUX may call CF after the quota flag is set');
+  const imageRequest = outgoing.find(r => r.url.endsWith('/generate/async'));
+  assert.equal(imageRequest.init.headers.apikey, 'test-secret');
+  assert.ok(!/[А-Яа-яЁё]/.test(JSON.parse(imageRequest.init.body).prompt));
+  const entries = restored.data.chains[0].entries;
+  assert.equal(entries[0].text, 'Весёлый осьминог печёт блины на Луне');
+  assert.equal(entries.filter(e => e.type === 'image').length, 1);
+  assert.equal(entries.find(e => e.type === 'image').author, 'AI Horde');
+  const quotaUntil = restored.data.cloudflareQuotaUntil;
+  await p.action(0, 'lobby'); assert.equal(restored.data.cloudflareQuotaUntil, quotaUntil);
+});
+
+test('five Russian prompts finish with two concurrent jobs and no repeated CF calls after quota detection', async t => {
+  const outgoing = mockHorde(t, { imageBytes: 32 });
+  const h = harness(); delete h.env.IMAGE_PROVIDER;
+  let cfCalls = 0; let p;
+  h.env.AI = { run: async () => {
+    assert.ok(!(p.room.data.cloudflareQuotaUntil > Date.now()), 'CF called after known exhaustion');
+    cfCalls++; throw new Error('3036: daily free allocation used up');
+  } };
+  p = await party(h, { count: 5, rounds: 1 });
+  await p.action(0, 'start');
+  for (let i = 0; i < 5; i++) await p.action(i, 'submit', `Осьминог номер ${i} печёт блины на Луне`);
+  await p.room.alarm(); const callsAtQuota = cfCalls;
+  assert.ok(callsAtQuota >= 1 && callsAtQuota <= 2);
+  for (let i = 0; i < 25 && p.room.data.phase === 'generating'; i++) {
+    await p.room.alarm();
+    assert.ok(p.room.data.jobs.filter(j => j.status === 'processing').length <= 2);
+  }
+  assert.equal(p.room.data.phase, 'reveal'); assert.equal(cfCalls, callsAtQuota);
+  assert.equal(outgoing.filter(r => r.url.endsWith('/generate/text/async')).length, 5);
+  assert.equal(outgoing.filter(r => r.url.endsWith('/generate/async')).length, 5);
+  assert.ok(p.room.data.chains.every(chain => chain.entries.filter(e => e.type === 'image').length === 1));
+});
+
+test('after the persisted quota reset time a later game uses Cloudflare again', async t => {
+  const outgoing = mockHorde(t, { imageBytes: 32 });
+  const h = harness(); delete h.env.IMAGE_PROVIDER;
+  let exhausted = true; const calls = [];
+  h.env.AI = { run: async model => {
+    calls.push(model);
+    if (exhausted) throw new Error('3036: daily free allocation used up');
+    return model.includes('mistral-small') ? { response: 'An octopus on the Moon' } : { image: jpegBase64() };
+  } };
+  const p = await party(h, { count: 2, rounds: 1 });
+  await p.action(0, 'start'); await p.action(0, 'submit', 'Осьминог на Луне'); await p.action(1, 'skip');
+  await completeGeneration(p.room); await p.action(0, 'lobby');
+  assert.ok(p.room.data.cloudflareQuotaUntil > Date.now());
+  exhausted = false; p.room.data.cloudflareQuotaUntil = Date.now() - 1; await p.room.save();
+  await p.action(0, 'start'); await p.action(0, 'submit', 'Осьминог на Луне'); await p.action(1, 'skip');
+  await completeGeneration(p.room);
+  assert.equal(p.room.data.chains[0].entries.find(e => e.type === 'image').author, 'FLUX.1 schnell');
+  assert.equal((await p.state(0)).body.generation.provider, 'cloudflare');
+  assert.equal(calls.filter(model => model.includes('flux-1-schnell')).length, 1);
+  assert.equal(outgoing.filter(r => r.url.endsWith('/generate/text/async')).length, 1);
+});
+
+test('anonymous text 429 backs off without losing its start time and the five-minute deadline cancels the text ID', async t => {
+  const outgoing = mockHorde(t, { imageBytes: 32 }); const upstream = globalThis.fetch;
+  let submissions = 0;
+  globalThis.fetch = async (input, init = {}) => {
+    if (String(input).endsWith('/generate/text/async') && ++submissions === 1) return Response.json({ rc: 'TooManyPrompts' }, { status: 429 });
+    return upstream(input, init);
+  };
+  const h = harness(); const p = await party(h, { count: 2, rounds: 1 });
+  await p.action(0, 'start'); await p.action(0, 'submit', 'Осьминог на Луне'); await p.action(1, 'skip');
+  await p.room.alarm();
+  const job = p.room.data.jobs[0]; const started = job.translationStartedAt;
+  assert.equal(job.status, 'processing'); assert.equal(job.translationRequestId, undefined);
+  assert.ok(job.nextAttemptAt > Date.now());
+  await p.room.alarm(); assert.equal(submissions, 1, 'no POST during the backoff');
+  job.nextAttemptAt = Date.now() - 1; await p.room.save(); await p.room.alarm();
+  assert.equal(submissions, 2); assert.ok(job.translationRequestId);
+  assert.equal(job.translationStartedAt, started);
+  const id = job.translationRequestId;
+  job.translationStartedAt = Date.now() - 301000; await p.room.save(); await p.room.alarm();
+  assert.equal(job.status, 'failed'); assert.match(job.error, /за 5 минут/);
+  assert.equal(submissions, 2);
+  assert.ok(outgoing.some(r => r.init.method === 'DELETE' && r.url.endsWith(`/generate/text/status/${id}`)));
+});
+
+test('text poll errors use three strikes without resubmitting the translation', async t => {
+  const outgoing = mockHorde(t); const upstream = globalThis.fetch;
+  globalThis.fetch = async (input, init = {}) => {
+    if (String(input).includes('/generate/text/status/') && init.method !== 'DELETE') return Response.json({}, { status: 503 });
+    return upstream(input, init);
+  };
+  const h = harness(); const p = await party(h, { count: 2, rounds: 1 });
+  await p.action(0, 'start'); await p.action(0, 'submit', 'Осьминог на Луне'); await p.action(1, 'skip');
+  await p.room.alarm();
+  const id = p.room.data.jobs[0].translationRequestId; const began = p.room.data.jobs[0].translationStartedAt;
+  for (let i = 1; i <= 3; i++) { await p.room.alarm(); assert.equal(p.room.data.jobs[0].failures, i); }
+  assert.equal(p.room.data.jobs[0].status, 'failed');
+  assert.equal(p.room.data.jobs[0].translationStartedAt, began);
+  assert.equal(outgoing.filter(r => r.url.endsWith('/generate/text/async')).length, 1);
+  assert.equal(outgoing.filter(r => r.url.endsWith('/generate/async')).length, 0);
+  assert.ok(outgoing.some(r => r.init.method === 'DELETE' && r.url.endsWith(`/generate/text/status/${id}`)));
+});
+
+test('a late accepted text request is cancelled after skip and cannot write into a new game', async t => {
+  const outgoing = mockHorde(t); const upstream = globalThis.fetch;
+  let accept; let began;
+  const accepted = new Promise(resolve => { accept = resolve; });
+  const started = new Promise(resolve => { began = resolve; });
+  globalThis.fetch = async (input, init = {}) => {
+    if (String(input).endsWith('/generate/text/async')) { began(); return accepted; }
+    return upstream(input, init);
+  };
+  const h = harness({ background: true }); const p = await party(h, { count: 2, rounds: 1 });
+  await p.action(0, 'start'); await p.action(0, 'submit', 'Осьминог на Луне'); await p.action(1, 'skip');
+  await p.room.alarm(); await started;
+  await p.action(0, 'skip'); await p.action(0, 'lobby'); await p.action(0, 'start');
+  accept(Response.json({ id: 'late-text-request' })); await h.drain();
+  assert.equal(p.room.data.phase, 'writing'); assert.ok(p.room.data.chains.every(chain => chain.entries.length === 0));
+  assert.ok(outgoing.some(r => r.init.method === 'DELETE' && r.url.endsWith('/generate/text/status/late-text-request')));
+  assert.equal(outgoing.filter(r => r.url.endsWith('/generate/async')).length, 0);
+});
+
+test('known text requests are cancelled on host skip and room expiry', async t => {
+  const outgoing = mockHorde(t);
+  for (const reason of ['skip', 'expire']) {
+    const h = harness(); const p = await party(h, { count: 2, rounds: 1 });
+    await p.action(0, 'start'); await p.action(0, 'submit', 'Осьминог на Луне'); await p.action(1, 'skip'); await p.room.alarm();
+    const id = p.room.data.jobs[0].translationRequestId;
+    if (reason === 'skip') await p.action(0, 'skip');
+    else { p.room.data.expiresAt = Date.now() - 1; await p.room.alarm(); }
+    assert.ok(outgoing.some(r => r.init.method === 'DELETE' && r.url.endsWith(`/generate/text/status/${id}`)));
+  }
+});
+
+test('legacy generic translation failures recover on authenticated poll once, without touching unrelated failures', async t => {
+  const outgoing = mockHorde(t);
+  const h = harness(); let cfCalls = 0;
+  h.env.AI = { run: async () => { cfCalls++; throw new Error('CF must not be called for migrated jobs'); } };
+  const p = await party(h, { count: 2, rounds: 1 });
+  await p.action(0, 'start'); await p.action(0, 'submit', 'Осьминог на Луне'); await p.action(1, 'submit', 'A cat in a spaceship');
+  const legacy = p.room.data.jobs[0]; const other = p.room.data.jobs[1];
+  const oldError = 'Не удалось перевести описание на английский. Повторите генерацию или в следующем ходе напишите по-английски.';
+  p.room.failJob(legacy, oldError); p.room.failJob(other, 'Другая ошибка генерации.'); await p.room.save();
+  assert.equal((await h.call(`/api/rooms/${p.code}`)).response.status, 401); assert.equal(legacy.status, 'failed');
+  await p.state(0);
+  assert.equal(legacy.status, 'queued'); assert.equal(legacy.translationFallbackRecovered, true); assert.equal(other.status, 'failed');
+  assert.equal(p.room.data.chains[0].entries.filter(e => e.type === 'error').length, 0);
+  assert.equal(p.room.data.chains[0].entries[0].text, 'Осьминог на Луне');
+  p.room.failJob(legacy, oldError); await p.room.save(); await p.state(0);
+  assert.equal(legacy.status, 'failed', 'one-time migration must not loop');
+  assert.equal(outgoing.length, 0); assert.equal(cfCalls, 0);
+  assert.equal((await p.action(0, 'retry')).response.status, 200);
+  await completeGeneration(p.room);
+  assert.equal(p.room.data.phase, 'reveal'); assert.equal(cfCalls, 0);
+  assert.equal(outgoing.filter(r => r.url.endsWith('/generate/text/async')).length, 1);
+});
+
+test('the host retry action successfully recovers a legacy failure in the same request', async t => {
+  const outgoing = mockHorde(t, { imageBytes: 32 });
+  const h = harness(); const p = await party(h, { count: 2, rounds: 1 });
+  await p.action(0, 'start'); await p.action(0, 'submit', 'Осьминог на Луне'); await p.action(1, 'skip');
+  p.room.failJob(p.room.data.jobs[0], 'Не удалось перевести описание на английский. Повторите генерацию.'); await p.room.save();
+  assert.equal((await p.action(0, 'retry')).response.status, 200);
+  await completeGeneration(p.room);
+  assert.equal(p.room.data.phase, 'reveal');
+  assert.equal(outgoing.filter(r => r.url.endsWith('/generate/text/async')).length, 1);
 });
