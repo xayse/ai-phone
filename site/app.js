@@ -142,7 +142,8 @@
     const input = el('textarea'); input.id = 'answer'; input.maxLength = 400; input.rows = 5; input.required = true; input.placeholder = first ? 'Кот-диджей устраивает вечеринку на Сатурне…' : 'Кажется, это…'; input.value = safeGet(`prompto.draft.${roomCode}.${state.round}`) || '';
     const count = el('span', 'character-count', `${input.value.length}/400`); input.addEventListener('input', () => { safeSet(`prompto.draft.${roomCode}.${state.round}`, input.value); count.textContent = `${input.value.length}/400`; });
     const submit = el('button', 'button primary wide', 'Передать дальше ↗'); submit.type = 'submit'; submit.dataset.action = 'submit'; submit.id = 'submit-answer';
-    append(form, label, input, count, submit, actionButton('Пропустить этот ход', 'skip', 'text-button skip-turn')); form.addEventListener('submit', event => { event.preventDefault(); const text = input.value.trim(); if (text) act('submit', { text }); }); panel.append(form);
+    const languageHint = el('p', 'muted'); languageHint.id = 'language-hint';
+    append(form, label, input, count, languageHint, submit, actionButton('Пропустить этот ход', 'skip', 'text-button skip-turn')); form.addEventListener('submit', event => { event.preventDefault(); const text = input.value.trim(); if (text) act('submit', { text }); }); panel.append(form);
     const sent = el('div', 'submitted hidden'); sent.id = 'submitted'; append(sent, el('div', 'success-mark', '✓'), el('h2', '', 'Идея отправлена!'), el('p', '', 'Ждём остальных. Интересно, во что превратится твоя история?')); panel.append(sent);
     const progress = el('div', 'answer-progress'); progress.id = 'answer-progress'; panel.append(progress); append(grid, visual, panel); root.append(grid);
   }
@@ -182,6 +183,10 @@
       $('answer-form')?.classList.toggle('hidden', submitted); $('submitted')?.classList.toggle('hidden', !submitted);
       const ready = (state.players || []).filter(p => p.submitted).length;
       if ($('answer-progress')) $('answer-progress').textContent = `${ready} из ${state.players?.length || 0} уже передали идею`;
+      if ($('language-hint')) {
+        $('language-hint').textContent = state.translationAvailable === false ? 'Для более точного рисунка напиши по-английски.' : state.translationAvailable === true ? 'Можно писать по-русски — переведём для нейросети.' : '';
+        $('language-hint').classList.toggle('hidden', typeof state.translationAvailable !== 'boolean');
+      }
       if ($('submit-answer')) $('submit-answer').disabled = busy || submitted;
       updateTimer();
     }
