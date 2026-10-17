@@ -3,9 +3,11 @@ const ROOM_TTL = 24 * 60 * 60 * 1000;
 const JOB_TIMEOUT = 15 * 60 * 1000;
 const POLL_MS = 8000;
 const MAX_CONCURRENT = 2;
+const ATTEMPT_LEASE = 2 * 60 * 1000;
 const IMAGE_CHUNK = 96 * 1024;
 const MAX_IMAGE_BYTES = 2 * 1024 * 1024;
 const HORDE = 'https://aihorde.net/api/v2';
+const FLUX = '@cf/black-forest-labs/flux-1-schnell';
 const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 
 class HttpError extends Error {
@@ -21,6 +23,12 @@ const clamp = (value, min, max, fallback) => {
 const randomId = () => crypto.randomUUID();
 const playerToken = () => Array.from(crypto.getRandomValues(new Uint8Array(24)), n => n.toString(16).padStart(2, '0')).join('');
 const roomCode = () => Array.from(crypto.getRandomValues(new Uint8Array(6)), n => alphabet[n % alphabet.length]).join('');
+const imageProvider = env => env.IMAGE_PROVIDER !== 'horde' && typeof env.AI?.run === 'function' ? 'cloudflare' : 'horde';
+async function withTimeout(promise, milliseconds) {
+  let timer;
+  try { return await Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('Inference timeout')), milliseconds); })]); }
+  finally { clearTimeout(timer); }
+}
 const nameOf = name => {
   if (typeof name !== 'string' || !name.trim() || name.trim().length > 24) throw new HttpError(400, 'Ник должен содержать от 1 до 24 символов.');
   return name.trim();
@@ -74,7 +82,7 @@ export default {
     try {
       const url = new URL(request.url);
       if (request.method === 'OPTIONS') response = new Response(null, { status: 204 });
-      else if (request.method === 'GET' && url.pathname === '/api/health') response = json({ ok: true, service: 'ai-phone', generation: 'AI Horde', translationAvailable: typeof env.AI?.run === 'function' });
+      else if (request.method === 'GET' && url.pathname === '/api/health') response = json({ ok: true, service: 'ai-phone', imageProvider: imageProvider(env), generation: imageProvider(env) === 'cloudflare' ? 'Cloudflare FLUX.1 schnell + AI Horde fallback' : 'AI Horde', translationAvailable: typeof env.AI?.run === 'function' });
       else if (request.method === 'POST' && url.pathname === '/api/rooms') {
         const body = await bodyJson(request);
         // Check collisions in the object instead of ever overwriting an existing room.
@@ -129,7 +137,11 @@ export class Room {
     if (!this.data) return;
     let at = this.data.expiresAt;
     if (this.data.phase === 'writing') at = Math.min(at, this.data.deadline);
-    if (this.data.phase === 'generating' && this.data.jobs.some(j => ['queued', 'processing'].includes(j.status))) at = Math.min(at, Date.now() + POLL_MS);
+    if (this.data.phase === 'generating' && this.data.jobs.some(j => ['queued', 'processing'].includes(j.status))) {
+      const freeSlot = this.data.jobs.filter(j => j.status === 'processing').length < MAX_CONCURRENT;
+      const startSoon = freeSlot && this.data.jobs.some(j => j.status === 'queued');
+      at = Math.min(at, Date.now() + (startSoon ? 100 : POLL_MS));
+    }
     await this.storage.setAlarm(Math.max(Date.now() + 100, at));
   }
   auth(request, url) {
@@ -221,7 +233,8 @@ export class Room {
           this.finishGeneration();
           // State is saved before best-effort cancellation, so a network failure never loses the game.
           await this.save();
-          for (const id of requests) await this.cancel(id);
+          const cancellation = Promise.allSettled(requests.map(id => this.cancel(id)));
+          if (this.ctx.waitUntil) this.ctx.waitUntil(cancellation);
         } else throw new HttpError(409, 'Сейчас нельзя пропустить ход.');
         break;
       }
@@ -232,11 +245,11 @@ export class Room {
         for (const job of this.data.jobs) {
           if (job.status !== 'failed') continue;
           this.data.chains[job.chainIndex].entries = this.data.chains[job.chainIndex].entries.filter(e => e.jobId !== job.id || e.type !== 'error');
-          Object.assign(job, { status: 'queued', requestId: null, startedAt: null, error: null, failures: 0, waitSeconds: 0, queuePosition: 0 });
+          Object.assign(job, { status: 'queued', requestId: null, startedAt: null, error: null, failures: 0, waitSeconds: 0, queuePosition: 0, attemptId: null, attemptExpiresAt: null });
           retried++;
         }
         if (!retried) throw new HttpError(409, 'Ошибок пока нет. Картинки ещё создаются.');
-        if (!this.data.settings.model) this.data.generationModel = null;
+        if (!this.data.settings.model) { this.data.generationModel = null; this.modelLookup = null; }
         break;
       }
       case 'reveal-next': {
@@ -323,8 +336,8 @@ export class Room {
         queued: data.jobs.filter(j => j.status === 'queued').length,
         processing: processing.length,
         failed: data.jobs.filter(j => j.status === 'failed').length,
-        waitSeconds, queuePosition,
-        message: data.jobs.some(j => j.status === 'failed') ? `${data.jobs.find(j => j.status === 'failed').error} Ведущий может повторить запрос или продолжить с пропуском.` : waitSeconds > 60 ? `AI Horde оценивает ожидание примерно в ${Math.ceil(waitSeconds / 60)} мин. Время может меняться.` : 'Картинки создаются в общей очереди AI Horde. Это может занять несколько минут.'
+        waitSeconds, queuePosition, provider: imageProvider(this.env),
+        message: data.jobs.some(j => j.status === 'failed') ? `${data.jobs.find(j => j.status === 'failed').error} Ведущий может повторить запрос или продолжить с пропуском.` : waitSeconds > 60 ? `AI Horde оценивает ожидание примерно в ${Math.ceil(waitSeconds / 60)} мин. Время может меняться.` : processing.some(j => j.provider === 'cloudflare') ? 'Нейросеть рисует картинки. Это займёт немного времени.' : 'Картинки создаются в общей очереди AI Horde. Это может занять несколько минут.'
       }
     };
     if (data.phase === 'reveal') {
@@ -388,25 +401,20 @@ export class Room {
     if (job.imagePrompt) return job.imagePrompt;
     let prompt = job.text;
     if (/[А-Яа-яЁё]/.test(prompt) && typeof this.env.AI?.run === 'function') {
-      let timer;
       try {
-        const response = await Promise.race([
-          this.env.AI.run('@cf/meta/m2m100-1.2b', { text: prompt, source_lang: 'russian', target_lang: 'english' }),
-          new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('Translation timeout')), 20000); })
-        ]);
+        const response = await withTimeout(this.env.AI.run('@cf/meta/m2m100-1.2b', { text: prompt, source_lang: 'russian', target_lang: 'english' }), 20000);
         const translated = response?.translated_text;
         if (typeof translated !== 'string' || !/[A-Za-z]/.test(translated) || /[А-Яа-яЁё]/.test(translated)) throw new Error('Invalid translation');
         prompt = translated.trim().slice(0, 600);
       } catch {
-        throw new Error('Не удалось перевести описание на английский. Повторите генерацию или в следующем ходе напишите по-английски.');
-      } finally { clearTimeout(timer); }
+        const error = new Error('Не удалось перевести описание на английский. Повторите генерацию или в следующем ходе напишите по-английски.');
+        error.translationFailed = true;
+        throw error;
+      }
     }
-    // Original text is kept intact in the album. The translation never appears in public state.
-    job.imagePrompt = prompt.slice(0, 600);
-    await this.save();
-    return job.imagePrompt;
+    return prompt.slice(0, 600);
   }
-  async storeGeneration(generation, job) {
+  async readGeneration(generation) {
     if (generation.censored || generation.gen_metadata?.some(m => ['censorship', 'csam', 'nsfw'].includes(String(m.type).toLowerCase()))) throw new Error('AI Horde скрыл картинку. Попробуйте другое описание или пропустите ход.');
     let bytes;
     let mime = 'image/webp';
@@ -425,99 +433,209 @@ export class Room {
     } else {
       const encoded = generation.img.replace(/^data:image\/(?:webp|png|jpeg);base64,/, '');
       if (encoded.length > MAX_IMAGE_BYTES * 1.4) throw new Error('Слишком большой файл картинки.');
-      try { bytes = Uint8Array.from(atob(encoded), c => c.charCodeAt(0)); }
+      try {
+        if (typeof Uint8Array.fromBase64 === 'function') bytes = Uint8Array.fromBase64(encoded);
+        else {
+          const binary = atob(encoded);
+          bytes = new Uint8Array(binary.length);
+          for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        }
+      }
       catch { throw new Error('AI Horde вернул повреждённую картинку.'); }
     }
     if (!bytes.length || bytes.length > MAX_IMAGE_BYTES) throw new Error('AI Horde вернул картинку неподходящего размера.');
     if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) mime = 'image/png';
     else if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) mime = 'image/jpeg';
+    return { bytes, mime };
+  }
+  async storeGeneration(generation, job) {
+    return this.storeImage(await this.readGeneration(generation), job);
+  }
+  async storeImage({ bytes, mime }, job) {
+    const entries = this.data.chains[job.chainIndex].entries;
+    // Protect against repeated alarm delivery and late completions of the same attempt.
+    if (entries.some(e => e.type === 'image' && e.jobId === job.id)) { job.status = 'done'; return; }
     const imageId = randomId();
     const chunks = Math.ceil(bytes.length / IMAGE_CHUNK);
     for (let i = 0; i < chunks; i++) await this.storage.put(`image:${imageId}:${i}`, bytes.slice(i * IMAGE_CHUNK, (i + 1) * IMAGE_CHUNK));
     await this.storage.put(`image:${imageId}`, { chunks, mime, size: bytes.length });
-    this.data.chains[job.chainIndex].entries.push({ type: 'image', author: 'AI Horde', imageId, round: job.round, jobId: job.id });
+    entries.push({ type: 'image', author: job.provider === 'cloudflare' ? 'FLUX.1 schnell' : 'AI Horde', imageId, round: job.round, jobId: job.id });
     job.status = 'done'; job.imageId = imageId; job.error = null;
   }
 
-  async processGeneration() {
-    // Poll current work first, then fill newly available slots. No more than two remote jobs per room.
+  activeAttempt(plan) {
+    if (!this.data || this.data.phase !== 'generating' || this.data.round !== plan.round) return null;
+    return this.data.jobs.find(job => job.id === plan.job.id && job.status === 'processing' && job.attemptId === plan.attemptId) || null;
+  }
+  clearAttempt(job) { job.attemptId = null; job.attemptExpiresAt = null; }
+  async updateAttempt(plan, update) {
+    return this.exclusive(async () => {
+      const job = this.activeAttempt(plan);
+      if (!job) return false;
+      await update(job);
+      this.finishGeneration();
+      await this.save(); await this.schedule();
+      return true;
+    });
+  }
+
+  // Planning and result commits hold the room lock. Translation, inference and all remote
+  // requests run outside it, so participants can still poll, skip and start a new game.
+  prepareGeneration() {
+    const plans = [];
+    const makePlan = (job, operation) => {
+      job.attemptId = randomId(); job.attemptExpiresAt = Date.now() + ATTEMPT_LEASE;
+      plans.push({ job: structuredClone(job), attemptId: job.attemptId, round: this.data.round,
+        generationId: this.data.jobs[0]?.id, settingsModel: this.data.settings.model, operation });
+    };
     for (const job of this.data.jobs.filter(j => j.status === 'processing')) {
-      try {
+      if (job.attemptId && job.attemptExpiresAt > Date.now()) continue;
+      // A requestId always wins over new provider preferences after a deployment.
+      if (job.requestId) {
+        job.provider = 'horde';
         if (Date.now() - job.startedAt >= JOB_TIMEOUT) {
           this.failJob(job, 'AI Horde не успел создать картинку за 15 минут. Повторите или пропустите генерацию.');
-          await this.save(); await this.cancel(job.requestId); continue;
-        }
-        const check = await this.horde(`/generate/check/${encodeURIComponent(job.requestId)}`);
-        job.waitSeconds = typeof check.wait_time === 'number' && Number.isFinite(check.wait_time) ? clamp(check.wait_time, 0, 86400, 0) : 0;
-        job.queuePosition = typeof check.queue_position === 'number' && Number.isFinite(check.queue_position) ? clamp(check.queue_position, 0, 1000000, 0) : 0;
-        if (check.faulted || check.is_possible === false) { this.failJob(job, 'Сейчас в AI Horde нет доступного исполнителя. Повторите запрос позже.'); continue; }
-        if (!check.done && !(check.finished >= 1)) { job.failures = 0; continue; }
-        const status = await this.horde(`/generate/status/${encodeURIComponent(job.requestId)}`);
-        if (!status.generations?.length) throw new Error('AI Horde завершил запрос без картинки.');
-        await this.storeGeneration(status.generations[0], job);
-        // A successful /check does not prove that the completed result can be retrieved.
-        job.failures = 0;
-      } catch (error) {
-        job.failures = (job.failures || 0) + 1;
-        // Temporary network hiccups do not discard an accepted Horde request.
-        if (job.failures >= 3 || /скрыл|неизвестный|подходящего|повреждённую|большой/.test(error.message)) {
-          this.failJob(job, String(error.message || 'Ошибка AI Horde.').slice(0, 220));
-          await this.cancel(job.requestId);
-        }
+          this.clearAttempt(job);
+          plans.push({ operation: 'cancel', requestId: job.requestId });
+        } else makePlan(job, 'poll');
+      } else if (job.provider === 'cloudflare') {
+        // Recover an interrupted/evicted CF attempt by using Horde once, rather than
+        // repeatedly spending the free AI quota on the same image.
+        job.provider = 'horde'; job.cloudflareAttempted = true;
+        makePlan(job, 'submit');
+      } else {
+        this.failJob(job, 'Не удалось получить подтверждение генерации. Повторите запрос или пропустите ход.');
+        this.clearAttempt(job);
       }
-      await this.save();
-    }
-    // Omitting models can pin a request to Horde's legacy default even when nobody hosts it.
-    // Resolve an online model once per round; prefer 512px general models for the free queue.
-    if (this.data.generationModel === null) {
-      this.data.generationModel = this.data.settings.model || '';
-      if (!this.data.generationModel) {
-        try {
-          const models = await this.horde('/status/models?type=image&min_count=1');
-          const active = Array.isArray(models) ? models.filter(m => m.name && m.count > 0 && m.type !== 'text').sort((a, b) => b.count - a.count) : [];
-          const preferred = active.find(m => /^(dreamshaper|deliberate)(?:\s+\d[\d.]*)?$/i.test(m.name));
-          const small = active.find(m => !/sdxl|\bxl\b|flux|pony/i.test(m.name));
-          this.data.generationModel = (preferred || small || active[0])?.name || '';
-        } catch { /* A brief model-list failure need not prevent Horde's normal fallback. */ }
-      }
-      await this.save();
     }
     let active = this.data.jobs.filter(j => j.status === 'processing').length;
     for (const job of this.data.jobs.filter(j => j.status === 'queued')) {
       if (active >= MAX_CONCURRENT) break;
-      try {
-        const imagePrompt = await this.imagePrompt(job);
-        const model = this.data.generationModel;
-        const size = /sdxl|\bxl\b|flux|pony/i.test(model) ? 1024 : 512;
-        const params = {
-          prompt: `${imagePrompt} ### text, watermark, signature, blurry`,
-          params: { n: 1, width: size, height: size, steps: 20, cfg_scale: 7, sampler_name: 'k_euler_a', karras: true, clip_skip: 1 },
-          nsfw: false, censor_nsfw: true, r2: true, shared: false, replacement_filter: true, trusted_workers: true,
-          ...(model ? { models: [model] } : {})
-        };
-        const result = await this.horde('/generate/async', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(params) });
-        if (!result.id) throw new Error('AI Horde не принял запрос на генерацию.');
-        Object.assign(job, { status: 'processing', requestId: result.id, startedAt: Date.now(), failures: 0 });
-        active++;
-      } catch (error) { this.failJob(job, String(error.message || 'Ошибка AI Horde.').slice(0, 220)); }
-      await this.save();
+      job.provider = !job.cloudflareAttempted ? imageProvider(this.env) : 'horde';
+      job.status = 'processing'; job.startedAt = Date.now();
+      if (job.provider === 'cloudflare') job.cloudflareAttempted = true;
+      makePlan(job, 'submit'); active++;
     }
-    this.finishGeneration();
+    return plans;
+  }
+
+  async hordeModel(plan) {
+    if (plan.settingsModel) return plan.settingsModel;
+    const cached = await this.exclusive(() => this.activeAttempt(plan) ? { model: this.data.generationModel } : null);
+    if (!cached) return undefined;
+    if (typeof cached.model === 'string') return cached.model;
+    if (this.modelLookup?.generationId !== plan.generationId) {
+      this.modelLookup = { generationId: plan.generationId, promise: (async () => {
+        try {
+          const models = await this.horde('/status/models?type=image&min_count=1');
+          const available = Array.isArray(models) ? models.filter(m => m.name && m.count > 0 && m.type !== 'text').sort((a, b) => b.count - a.count) : [];
+          const preferred = available.find(m => /^(dreamshaper|deliberate)(?:\s+\d[\d.]*)?$/i.test(m.name));
+          return (preferred || available.find(m => !/sdxl|\bxl\b|flux|pony/i.test(m.name)) || available[0])?.name || '';
+        } catch { return ''; }
+      })() };
+    }
+    const model = await this.modelLookup.promise;
+    return await this.updateAttempt(plan, () => { this.data.generationModel = model; }) ? model : undefined;
+  }
+
+  async submitHorde(plan, prompt) {
+    const model = await this.hordeModel(plan);
+    if (model === undefined) return;
+    if (!await this.updateAttempt(plan, job => { job.provider = 'horde'; })) return;
+    const size = /sdxl|\bxl\b|flux|pony/i.test(model) ? 1024 : 512;
+    const payload = {
+      prompt: `${prompt} ### text, watermark, signature, blurry`,
+      params: { n: 1, width: size, height: size, steps: 20, cfg_scale: 7, sampler_name: 'k_euler_a', karras: true, clip_skip: 1 },
+      nsfw: false, censor_nsfw: true, r2: true, shared: false, replacement_filter: true, trusted_workers: true,
+      ...(model ? { models: [model] } : {})
+    };
+    const result = await this.horde('/generate/async', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+    if (!result.id) throw new Error('AI Horde не принял запрос на генерацию.');
+    const accepted = await this.updateAttempt(plan, job => {
+      Object.assign(job, { provider: 'horde', requestId: result.id, startedAt: Date.now(), failures: 0, waitSeconds: 0, queuePosition: 0 });
+      this.clearAttempt(job);
+    });
+    if (!accepted) await this.cancel(result.id);
+  }
+
+  async generateNew(plan) {
+    const prompt = await this.imagePrompt(plan.job);
+    // Persist the English text once, privately, before attempting either generator.
+    if (!await this.updateAttempt(plan, job => { job.imagePrompt = prompt; })) return;
+    if (plan.job.provider === 'cloudflare') {
+      try {
+        const result = await withTimeout(this.env.AI.run(FLUX, { prompt, steps: 4 }), 35000);
+        if (typeof result?.image !== 'string' || !result.image) throw new Error('Cloudflare did not return an image');
+        const image = await this.readGeneration({ img: `data:image/jpeg;base64,${result.image}` });
+        await this.updateAttempt(plan, async job => {
+          job.provider = 'cloudflare';
+          await this.storeImage(image, job); job.failures = 0; this.clearAttempt(job);
+        });
+        return;
+      } catch {
+        // Quota limits, inference timeouts and unsupported requests all use the same
+        // saved job and translation. No successful image or original prompt is replaced.
+        if (!await this.updateAttempt(plan, job => { job.provider = 'horde'; job.cloudflareAttempted = true; })) return;
+      }
+    }
+    await this.submitHorde(plan, prompt);
+  }
+
+  async pollHorde(plan) {
+    const check = await this.horde(`/generate/check/${encodeURIComponent(plan.job.requestId)}`);
+    const pending = !check.done && !(check.finished >= 1);
+    const applied = await this.updateAttempt(plan, job => {
+      job.waitSeconds = typeof check.wait_time === 'number' && Number.isFinite(check.wait_time) ? clamp(check.wait_time, 0, 86400, 0) : 0;
+      job.queuePosition = typeof check.queue_position === 'number' && Number.isFinite(check.queue_position) ? clamp(check.queue_position, 0, 1000000, 0) : 0;
+      if (check.faulted || check.is_possible === false) {
+        this.failJob(job, 'Сейчас в AI Horde нет доступного исполнителя. Повторите запрос позже.'); this.clearAttempt(job);
+      } else if (pending) { job.failures = 0; this.clearAttempt(job); }
+    });
+    if (!applied || pending || check.faulted || check.is_possible === false) return;
+    const status = await this.horde(`/generate/status/${encodeURIComponent(plan.job.requestId)}`);
+    if (!status.generations?.length) throw new Error('AI Horde завершил запрос без картинки.');
+    const image = await this.readGeneration(status.generations[0]);
+    await this.updateAttempt(plan, async job => {
+      await this.storeImage(image, job); job.failures = 0; this.clearAttempt(job);
+    });
+  }
+
+  async runPlan(plan) {
+    if (plan.operation === 'cancel') return this.cancel(plan.requestId);
+    try {
+      if (plan.operation === 'poll') await this.pollHorde(plan);
+      else await this.generateNew(plan);
+    } catch (error) {
+      let cancel = false;
+      await this.updateAttempt(plan, job => {
+        job.failures = (job.failures || 0) + 1;
+        if (plan.operation !== 'poll' || job.failures >= 3 || /скрыл|неизвестный|подходящего|повреждённую|большой/.test(error.message)) {
+          this.failJob(job, String(error.message || 'Не удалось создать картинку. Повторите запрос.').slice(0, 220));
+          cancel = Boolean(job.requestId);
+          if (error.translationFailed) job.cloudflareAttempted = false;
+        }
+        this.clearAttempt(job);
+      });
+      if (cancel) await this.cancel(plan.job.requestId);
+    }
   }
 
   async alarm() {
-    return this.exclusive(async () => {
-      if (!this.data) return;
+    const plans = await this.exclusive(async () => {
+      if (!this.data) return [];
       if (this.data.expiresAt <= Date.now()) {
-        for (const job of this.data.jobs || []) if (job.status === 'processing') await this.cancel(job.requestId);
+        const cancellations = this.data.jobs.filter(j => j.requestId && j.status === 'processing').map(j => ({ operation: 'cancel', requestId: j.requestId }));
         await this.storage.deleteAll(); this.data = null;
         if (this.storage.deleteAlarm) await this.storage.deleteAlarm();
-        return;
+        return cancellations;
       }
-      try {
-        if (this.data.phase === 'writing' && this.data.deadline <= Date.now()) await this.beginGeneration();
-        if (this.data.phase === 'generating') await this.processGeneration();
-      } finally { await this.save(); await this.schedule(); }
+      if (this.data.phase === 'writing' && this.data.deadline <= Date.now()) await this.beginGeneration();
+      const tasks = this.data.phase === 'generating' ? this.prepareGeneration() : [];
+      await this.save(); await this.schedule();
+      return tasks;
     });
+    const work = Promise.allSettled(plans.map(plan => this.runPlan(plan)));
+    if (this.ctx.waitUntil) this.ctx.waitUntil(work);
+    else await work; // Minimal Node storage mocks can await a whole batch without a runtime context.
   }
 }
