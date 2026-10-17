@@ -1,0 +1,17 @@
+name: Check game
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: node --check site/app.js
+      - run: node --check server/worker.mjs
+      - run: node --test server/*.test.mjs
