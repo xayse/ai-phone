@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f8f5ed">
+  <meta name="description" content="Промптофон — игра в испорченный телефон, где рисует нейросеть, а угадывают друзья.">
+  <title>Промптофон — передай воображение</title>
+  <link rel="stylesheet" href="./style.css">
+  <script defer src="./config.js"></script>
+  <script defer src="./app.js"></script>
+</head>
+<body>
+  <div class="grain" aria-hidden="true"></div>
+  <header class="topbar wrap">
+    <a class="brand" href="./" aria-label="Промптофон — главная"><span class="brand-mark" aria-hidden="true">✳</span>промптофон<span class="brand-dot">.</span></a>
+    <div class="top-right"><span id="connection" class="connection"><i></i> для друзей и фантазии</span><button id="leave" class="text-button hidden" type="button">Выйти</button></div>
+  </header>
+  <main class="wrap">
+    <div id="notice" class="notice hidden" role="alert"></div>
+    <section id="entry" class="entry">
+      <div class="hero">
+        <div class="eyebrow"><span class="tiny-star">✦</span> ИСПОРЧЕННЫЙ ТЕЛЕФОН, НО С НЕЙРОСЕТЬЮ</div>
+        <h1>Одна мысль.<br>Сто <span class="purple-word">неожиданных</span><br><span class="underline-word">поворотов.</span></h1>
+        <p class="hero-description">Ты придумываешь. Нейросеть рисует.<br>Друзья угадывают. И всё идёт немного не так.</p>
+        <div class="sample-chain" aria-label="Пример цепочки">
+          <div class="sample-note note-one"><span class="note-label">ПРОМПТ</span><strong>Кот захватил<br>космический корабль</strong><span class="note-doodle">✧</span></div>
+          <span class="chain-arrow" aria-hidden="true">↝</span>
+          <div class="sample-note note-two"><span class="note-label">НЕЙРОСЕТЬ</span><div class="space-cat" aria-hidden="true"><span>🛸</span><b>🐈</b><i>✦</i></div></div>
+          <span class="chain-arrow last-arrow" aria-hidden="true">↝</span>
+          <div class="sample-note note-three"><span class="note-label">ДРУГ УВИДЕЛ</span><strong>«Тигр работает<br>в такси на Луне»</strong></div>
+        </div>
+      </div>
+      <div class="entry-side">
+        <div class="play-card">
+          <div class="card-sticker" aria-hidden="true">LET’S PLAY!</div>
+          <div class="card-intro"><span class="hand-star" aria-hidden="true">✳</span><div><h2>Собирай своих</h2><p>Вход по нику. Смех — по цепочке.</p></div></div>
+          <div class="tabs" role="tablist" aria-label="Вход в игру"><button id="create-tab" role="tab" aria-selected="true" type="button">Создать комнату</button><button id="join-tab" role="tab" aria-selected="false" type="button">Присоединиться</button></div>
+          <form id="entry-form">
+            <label for="nickname">Как тебя называть?</label>
+            <input id="nickname" name="name" placeholder="Например, Космокот" maxlength="24" autocomplete="nickname" required>
+            <div id="join-fields" class="hidden"><label for="room-code">Код комнаты</label><input id="room-code" class="code-input" placeholder="ABC123" maxlength="8" autocomplete="off" autocapitalize="characters" spellcheck="false"></div>
+            <div id="create-fields">
+              <div class="field-pair"><div><label for="round-count">Ходов в цепочке</label><select id="round-count"><option value="3">3 — короткая игра</option><option value="5">5 — побольше хаоса</option><option value="8">8 — длинная история</option></select></div><div><label for="turn-time">Время на ответ</label><select id="turn-time"><option value="60">60 секунд</option><option value="90" selected>90 секунд</option><option value="120">120 секунд</option></select></div></div>
+            </div>
+            <button id="enter-button" class="button primary wide" type="submit">Создать комнату <span aria-hidden="true">↗</span></button>
+            <p class="card-footnote">2–8 игроков · бесплатно · прямо в браузере</p>
+          </form>
+        </div>
+        <details id="server-details" class="server-details"><summary>Подключение к серверу игры <span id="server-badge"></span></summary><div class="server-settings"><p>Сайт живёт на GitHub Pages, а комнаты — на отдельном сервере. Организатор указывает его адрес один раз.</p><label for="server-url">Адрес сервера</label><input id="server-url" type="url" placeholder="https://prompto.example.workers.dev"><button id="save-server" class="button secondary" type="button">Сохранить адрес</button></div></details>
+      </div>
+    </section>
+    <section id="game" class="game hidden" aria-live="polite"></section>
+    <section id="how-it-works" class="how-it-works">
+      <div class="section-tag">МАЛЕНЬКАЯ ИНСТРУКЦИЯ, БОЛЬШАЯ ПУТАНИЦА</div>
+      <div class="steps"><div><span class="step-number">01</span><h3>Загадай что угодно</h3><p>Напиши идею. Чем страннее,<br>тем интереснее получится.</p></div><div><span class="step-number">02</span><h3>Доверься нейросети</h3><p>AI Horde превратит слова<br>в картинку и передаст дальше.</p></div><div><span class="step-number">03</span><h3>Угадай и передай</h3><p>Опиши чужую картинку.<br>В финале раскройте все цепочки.</p></div></div>
+    </section>
+  </main>
+  <footer class="wrap footer"><span>Слова → картинки → полная неожиданность</span><span>Сделано для совместного веселья <b>✦</b></span></footer>
+  <div id="toast" class="toast hidden" role="status"></div>
+</body>
+</html>
