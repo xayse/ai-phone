@@ -259,3 +259,30 @@ test('failed translation stops an unrelated Horde request and the host can retry
   const noAI = harness();
   assert.equal((await noAI.call('/api/health')).body.translationAvailable, false);
 });
+
+test('successful completion checks do not erase repeated result retrieval failures', async t => {
+  mockHorde(t, { imageBytes: 32 });
+  const upstream = globalThis.fetch;
+  let resultAttempts = 0;
+  globalThis.fetch = async (input, init = {}) => {
+    if (String(input).includes('/generate/status/') && init.method !== 'DELETE') {
+      resultAttempts++;
+      return Response.json({ error: 'temporary result retrieval failure' }, { status: 503 });
+    }
+    return upstream(input, init);
+  };
+  const h = harness(); const p = await party(h, { count: 2, rounds: 1 });
+  await p.action(0, 'start');
+  await p.action(0, 'submit', 'An octopus cooking pancakes on the Moon'); await p.action(1, 'skip');
+  await p.room.alarm(); // Accept one Horde request.
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    await p.room.alarm();
+    const job = p.room.data.jobs[0];
+    assert.equal(job.failures, attempt);
+    assert.equal(job.status, attempt < 3 ? 'processing' : 'failed');
+  }
+  assert.equal(resultAttempts, 3);
+  const state = (await p.state(0)).body;
+  assert.equal(state.phase, 'generating'); assert.equal(state.generation.failed, 1);
+  assert.match(state.generation.message, /503/);
+});

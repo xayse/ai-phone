@@ -443,12 +443,13 @@ export class Room {
           await this.save(); await this.cancel(job.requestId); continue;
         }
         const check = await this.horde(`/generate/check/${encodeURIComponent(job.requestId)}`);
-        job.failures = 0;
         if (check.faulted || check.is_possible === false) { this.failJob(job, 'Сейчас в AI Horde нет доступного исполнителя. Повторите запрос позже.'); continue; }
-        if (!check.done && !(check.finished >= 1)) continue;
+        if (!check.done && !(check.finished >= 1)) { job.failures = 0; continue; }
         const status = await this.horde(`/generate/status/${encodeURIComponent(job.requestId)}`);
         if (!status.generations?.length) throw new Error('AI Horde завершил запрос без картинки.');
         await this.storeGeneration(status.generations[0], job);
+        // A successful /check does not prove that the completed result can be retrieved.
+        job.failures = 0;
       } catch (error) {
         job.failures = (job.failures || 0) + 1;
         // Temporary network hiccups do not discard an accepted Horde request.
