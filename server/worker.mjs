@@ -402,7 +402,7 @@ export class Room {
     let prompt = job.text;
     if (/[А-Яа-яЁё]/.test(prompt) && typeof this.env.AI?.run === 'function') {
       try {
-        const response = await withTimeout(this.env.AI.run('@cf/meta/m2m100-1.2b', { text: prompt, source_lang: 'russian', target_lang: 'english' }), 20000);
+        const response = await withTimeout(this.env.AI.run('@cf/meta/m2m100-1.2b', { text: prompt, source_lang: 'ru', target_lang: 'en' }), 20000);
         const translated = response?.translated_text;
         if (typeof translated !== 'string' || !/[A-Za-z]/.test(translated) || /[А-Яа-яЁё]/.test(translated)) throw new Error('Invalid translation');
         prompt = translated.trim().slice(0, 600);

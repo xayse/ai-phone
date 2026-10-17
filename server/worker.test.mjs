@@ -223,8 +223,8 @@ test('Russian prompts translate once for Horde while the album keeps the origina
   await completeGeneration(p.room);
   assert.equal(translations.length, 1);
   assert.equal(translations[0].model, '@cf/meta/m2m100-1.2b');
-  assert.equal(translations[0].input.source_lang, 'russian');
-  assert.equal(translations[0].input.target_lang, 'english');
+  assert.equal(translations[0].input.source_lang, 'ru');
+  assert.equal(translations[0].input.target_lang, 'en');
   const sent = outgoing.filter(r => r.url.endsWith('/generate/async')).map(r => JSON.parse(r.init.body).prompt);
   assert.ok(sent.some(prompt => prompt.startsWith('A cheerful octopus is cooking pancakes on the Moon')));
   assert.ok(sent.some(prompt => prompt.startsWith('A dog drives a tiny blue car')));
