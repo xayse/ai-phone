@@ -148,7 +148,7 @@
     const progress = el('div', 'answer-progress'); progress.id = 'answer-progress'; panel.append(progress); append(grid, visual, panel); root.append(grid);
   }
   function buildGenerating(root) {
-    root.append(gameHeader('МАГИЯ В ПРОЦЕССЕ', 'Воображение вышло на смену.', 'AI Horde рисует ваши идеи. Очередь общая, поэтому иногда нужно немного подождать.'));
+    root.append(gameHeader('МАГИЯ В ПРОЦЕССЕ', 'Воображение вышло на смену.', 'Нейросеть рисует ваши идеи. Скоро передадим картинки дальше.'));
     const box = el('div', 'panel generation-panel'); append(box, el('div', 'generation-orbit', '✳'), el('h2', '', 'Слова превращаются в картинки'));
     const progress = el('div', 'progress-track'); const fill = el('div', 'progress-fill'); fill.id = 'generation-fill'; progress.append(fill); box.append(progress);
     const status = el('p', 'generation-status'); status.id = 'generation-status'; box.append(status); const message = el('p', 'muted'); message.id = 'generation-message'; box.append(message);
