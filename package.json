@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Игра в испорченный телефон с картинками AI Horde",
+  "description": "Игра в испорченный телефон с картинками FLUX и AI Horde",
   "scripts": {
     "start": "node server/local.mjs",
     "test": "node --test server/*.test.mjs",
